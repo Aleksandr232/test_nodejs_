@@ -1,0 +1,91 @@
+name: digital-goods
+
+services:
+  mysql:
+    image: mysql:8.0
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --innodb-lock-wait-timeout=10
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: store
+      MYSQL_USER: store
+      MYSQL_PASSWORD: store
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  supplier-a:
+    build: .
+    command: node src/suppliers/server.js
+    restart: unless-stopped
+    environment:
+      PORT: 3001
+      SUPPLIER_NAME: A
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: store
+      MYSQL_PASSWORD: store
+      MYSQL_DATABASE: store
+      FAIL_RATE: "0.20"
+      TIMEOUT_RATE: "0.15"
+      HANG_MS: "20000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+
+  supplier-b:
+    build: .
+    command: node src/suppliers/server.js
+    restart: unless-stopped
+    environment:
+      PORT: 3002
+      SUPPLIER_NAME: B
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: store
+      MYSQL_PASSWORD: store
+      MYSQL_DATABASE: store
+      FAIL_RATE: "0.08"
+      TIMEOUT_RATE: "0.05"
+      HANG_MS: "20000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "3002:3002"
+
+  app:
+    build: .
+    command: node src/index.js
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: store
+      MYSQL_PASSWORD: store
+      MYSQL_DATABASE: store
+      SUPPLIER_A_URL: http://supplier-a:3001
+      SUPPLIER_B_URL: http://supplier-b:3002
+      SUPPLIER_TIMEOUT_MS: "2500"
+      LOG_LEVEL: info
+    depends_on:
+      mysql:
+        condition: service_healthy
+      supplier-a:
+        condition: service_started
+      supplier-b:
+        condition: service_started
+    ports:
+      - "3000:3000"
+
+volumes:
+  mysql_data:

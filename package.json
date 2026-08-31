@@ -1,0 +1,23 @@
+{
+  "name": "digital-goods-core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ядро магазина цифровых товаров: платежи, выдача, exactly-once",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "supplier": "node src/suppliers/server.js",
+    "test:acceptance": "node scripts/acceptance.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "mysql2": "^3.14.0",
+    "nanoid": "^5.1.5",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0",
+    "swagger-ui-express": "^5.0.1"
+  }
+}
