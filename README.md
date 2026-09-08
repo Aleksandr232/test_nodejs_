@@ -68,38 +68,109 @@ node scripts/acceptance.mjs
 12. Всплеск + RPM лимит поставщика → заказы в очереди, ничего не теряется
 13. Точка-in-time по `order_events` / леджеру
 
-### Как воспроизвести сложные кейсы вручную
+## Как воспроизвести частичный сбой заказа и поведение при недобросовестном поставщике
 
-**Частичный сбой заказа**
+Автоматом: сценарии 7–11 в `node scripts/acceptance.mjs`. Ниже — вручную. Подставьте `ORD_ID` и `amount` из ответа create.
+
+### Частичный сбой заказа
+
+Один заказ, два товара. Steam выдаётся, Tarkov падает на A и B. Выданное остаётся, за невыданное — возврат.
 
 ```bash
 curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\",\"fail_skus\":[\"KEY-EFT\"]}"
 curl -s -X POST http://localhost:3002/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\",\"fail_skus\":[\"KEY-EFT\"]}"
-# заказ из STEAM-TOPUP-2500 + KEY-EFT → оплата → partially_fulfilled
+
+curl -s -X POST http://localhost:3000/api/orders -H "Content-Type: application/json" -d "{\"items\":[{\"sku\":\"STEAM-TOPUP-2500\"},{\"sku\":\"KEY-EFT\"}]}"
+
+curl -s -X POST http://localhost:3000/webhook/payment -H "Content-Type: application/json" -d "{\"event_id\":\"evt_partial_1\",\"order_id\":\"ORD_ID\",\"status\":\"paid\",\"amount\":5990,\"currency\":\"RUB\",\"created_at\":\"2026-01-01T12:00:00Z\"}"
+
+curl -s http://localhost:3000/api/orders/ORD_ID
 ```
 
-**Недобросовестный поставщик**
+Ожидание: `partially_fulfilled`; Steam `delivered` с кодом; EFT `refunded` без кода; `money.paid = 5990`, `delivered = 2500`, `refunded = 3490`, `outstanding = 0`.
+
+Повтор вебхука или `POST /api/orders/ORD_ID/retry-delivery` не выдаёт второй код и не делает второй возврат.
+
+### Недобросовестный поставщик
+
+Телу HTTP не верим. Код берём только по стабильному `request_id` и только если его ещё никто не занял (`claimed_codes`).
+
+**Врал ошибкой** — ключ выдал, ответил 503. Покупатель всё равно получает этот код, fallback на B нет.
 
 ```bash
-# выдал, но ответил 503
 curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"lie_error\"}"
+curl -s -X POST http://localhost:3002/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\"}"
 
-# отдать код из чужого заказа
-curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"duplicate_code\"}"
-
-# ловушка таймаута (allocate, потом hang) — массовый заказ из нескольких sku
-curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"timeout\",\"hang_ms\":20000}"
+curl -s -X POST http://localhost:3000/api/orders -H "Content-Type: application/json" -d "{\"sku\":\"SUB-YT-3M\"}"
+# webhook paid на amount из ответа
+curl -s http://localhost:3000/api/orders/ORD_ID
+curl -s "http://localhost:3001/admin/issues?order_id=ORD_ID"
 ```
 
-**Деньги сходятся**
+Ожидание: `delivered`, `supplier: A`, у A ровно одна выдача, у B пусто. Повтор выдачи — тот же код.
+
+**Отдал чужой код.** Сначала обычный заказ, потом A присылает уже занятый ключ.
+
+```bash
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\"}"
+# заказ SUB-DISCORD-1M → оплата → запомнить code
+
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"duplicate_code\"}"
+# заказ SUB-SPOTIFY-1M → оплата
+```
+
+Ожидание: у второго заказа другой код (A отвергли, выдал B). Один код не сидит в двух заказах.
+
+**Подменил код в JSON** — в теле `WRONG-…`, в allocate другой.
+
+```bash
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"wrong_code\"}"
+# заказ GIFT-PSN-1000 → оплата
+```
+
+Ожидание: покупатель получает код из allocate, не `WRONG-…`.
+
+**Падение после выдачи** (массово): A выделяет ключ и зависает. Таймаут ≠ отказ, на B не уходим.
+
+```bash
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"timeout\",\"hang_ms\":20000}"
+curl -s -X POST http://localhost:3002/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\"}"
+
+curl -s -X POST http://localhost:3000/api/orders -H "Content-Type: application/json" -d "{\"items\":[{\"sku\":\"GIFT-XBOX-1500\"},{\"sku\":\"GIFT-ROBLOX-800\"},{\"sku\":\"SUB-DISCORD-1M\"},{\"sku\":\"KEY-CS2-PRIME\"}]}"
+# webhook paid на amount из ответа
+```
+
+Ожидание: все 4 позиции `delivered` с A, коды разные, B молчит. Retry ничего не двоит.
+
+## Как проверить, что деньги сходятся
+
+Инвариант: **оплачено = выдано + возвращено**. В терминале заказа `money.outstanding === 0`.
+
+По одному заказу:
+
+```bash
+curl -s http://localhost:3000/api/orders/ORD_ID
+```
+
+- полный успех: `paid == delivered`, `refunded == 0`, `outstanding == 0`
+- частичный сбой (Steam + EFT): `paid == 5990`, `delivered == 2500`, `refunded == 3490`, `outstanding == 0`
+- полный возврат: `paid == refunded`, `delivered == 0`
+
+Повтор оплаты и `POST /api/orders/ORD_ID/retry-delivery` эти суммы не меняют.
+
+По всей системе:
 
 ```bash
 curl -s http://localhost:3000/api/reconcile
-# ok=true, ledger.balanced, money_mismatch=[]
-# у заказа: money.outstanding === 0  ⇔  paid = delivered + refunded
 ```
 
-Повтор оплаты, retry-delivery и рестарт в середине выдачи не создают второй код и второй возврат: `claimed_codes.code` UNIQUE, леджер `INSERT IGNORE` по `(order_id, item_id, event_type, account, direction)`, поставщику всегда тот же `request_id`.
+Сходится, если `ok: true`, `ledger.balanced: true`, `money_mismatch: []`, `delivered_not_paid: []`.
+
+`paid_not_delivered` может быть непустым — это ещё не дожатые `paid` / `out_of_stock`, не дыра в деньгах.
+
+Двойная запись, повтор — no-op (`INSERT IGNORE`): оплата Dr cash / Cr prepaid, выдача Dr prepaid / Cr revenue, возврат Dr prepaid / Cr cash.
+
+Снимок на дату: `GET /api/money/at?at=2026-09-08T12:00:00Z` — тоже `balanced: true`.
 
 ## Ключевые решения этапа 2
 
