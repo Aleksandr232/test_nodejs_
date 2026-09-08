@@ -1,8 +1,9 @@
 # Ядро магазина цифровых товаров
 
-Backend для площадки вроде GGSel: заказ по SKU → вебхук оплаты → автоматическая выдача кода.
+Backend для площадки вроде GGSel. Этап 1: заказ → оплата → exactly-once выдача.  
+Этап 2: **мультипозиционный заказ**, **частичный возврат**, **поставщик которому нельзя верить**, очередь с RPM и точка-in-time.
 
-Стек: **Node.js 20 + Express + MySQL 8 + Docker Compose**. Реального эквайринга и поставщиков нет — всё на заглушках.
+Стек: **Node.js 20 + Express + MySQL 8 + Docker Compose**. Эквайринг и поставщики — заглушки.
 
 
 
@@ -20,19 +21,20 @@ Swagger: http://localhost:3000/docs
 Поставщик B: http://localhost:3002  
 MySQL с хоста: `127.0.0.1:3307` (логин `store` / `store`, БД `store`)
 
-Первый старт поднимает ~2500 SKU и пул ключей.
-
-### Ручной сценарий
+### Ручной сценарий (как в этапе 1)
 
 ```bash
-# создать заказ
 curl -s -X POST http://localhost:3000/api/orders -H "Content-Type: application/json" -d "{\"sku\":\"STEAM-TOPUP-500\"}"
 
-# эмуляция оплаты (подставьте id и amount из ответа)
 curl -s -X POST http://localhost:3000/webhook/payment -H "Content-Type: application/json" -d "{\"event_id\":\"evt_1\",\"order_id\":\"ord_xxx\",\"status\":\"paid\",\"amount\":500,\"currency\":\"RUB\",\"created_at\":\"2025-01-01T12:00:00Z\"}"
 
-# статус и код
 curl -s http://localhost:3000/api/orders/ord_xxx
+```
+
+Мультипозиционный заказ:
+
+```bash
+curl -s -X POST http://localhost:3000/api/orders -H "Content-Type: application/json" -d "{\"items\":[{\"sku\":\"STEAM-TOPUP-500\"},{\"sku\":\"KEY-GTA5\"}]}"
 ```
 
 Полезные эндпоинты:
@@ -40,61 +42,73 @@ curl -s http://localhost:3000/api/orders/ord_xxx
 | Метод | Путь | Назначение |
 | --- | --- | --- |
 | GET | `/docs` | Swagger UI |
-| GET | `/openapi.json` | OpenAPI spec |
-| POST | `/api/orders` | Создать заказ `{ sku, id? }` |
-| GET | `/api/orders/:id` | Заказ; `code` только в `delivered` |
-| POST | `/webhook/payment` | Вебхук оплаты (контракт из задания) |
-| GET | `/api/catalog` | Витрина остатков |
-| GET | `/api/catalog/explain` | EXPLAIN горячего запроса |
-| GET | `/api/reconcile` | Сверка и баланс леджера |
-| POST | `/api/orders/:id/retry-delivery` | Ручной повтор выдачи |
-| POST | `/api/admin/restock` | Пополнить ключ `{ sku, code }` |
+| POST | `/api/orders` | `{ sku }` или `{ items: [{ sku, qty }] }` |
+| GET | `/api/orders/:id` | Заказ, позиции, `money` (paid/delivered/refunded) |
+| GET | `/api/orders/:id/at?at=` | Состояние заказа на момент времени |
+| POST | `/webhook/payment` | Вебхук оплаты |
+| GET | `/api/reconcile` | Сверка, в том числе `money_mismatch` |
+| GET | `/api/queue` | Очередь выдачи и RPM поставщиков |
+| GET | `/api/money/at?at=` | Снимок леджера на дату |
+| POST | `/api/orders/:id/retry-delivery` | Идемпотентный повтор |
 
-## Как прогнать приёмку (гонки, таймаут, fallback)
-
-Тот же скрипт эмулирует оплату и гоняет состязательные сценарии:
+## Приёмка
 
 ```bash
 npm install
 node scripts/acceptance.mjs
 ```
 
-Он проверяет все 6 критериев:
+Этап 1 (гонки, таймаут, fallback) плюс этап 2:
 
-1. **50 параллельных вебхуков `paid`** по одному заказу → один код, один факт выдачи
-2. **Повтор с тем же `event_id`** → `duplicate: true`, заказ не меняется
-3. **Вебхук раньше заказа** и **failed после paid** — оба корректны
-4. **Таймаут поставщика A**, который уже выдал код: повтор с тем же `request_id`, **без fallback на B**, без второй выдачи
-5. **A недоступен (5xx)** → fallback на B, код ровно один
-6. **Пустой остаток** → `out_of_stock`, после restock заказ доходит до `delivered`, процесс не падает
+7. Частичный заказ: один SKU выдан, второй нет → возврат только за невыданное, `paid = delivered + refunded`
+8. Поставщик **врёт ошибкой** (`lie_error`: ключ выдал, HTTP 503) → код всё равно один, без fallback
+9. Поставщик **отдаёт чужой код** (`duplicate_code`) → второй заказ этот код не получает
+10. **Массовая выдача + падение поставщика**: 4 позиции, A зависает после allocate → все 4 доезжают по `request_id`, без второй выдачи и без B
+11. Поставщик **подменяет код в теле** (`wrong_code`) → покупатель получает код из allocate, не из JSON
+12. Всплеск + RPM лимит поставщика → заказы в очереди, ничего не теряется
+13. Точка-in-time по `order_events` / леджеру
 
-Скрипт сам переключает заглушки через `POST /admin/config` (`force_mode`: `ok` / `fail` / `timeout`).
+### Как воспроизвести сложные кейсы вручную
 
-Точечно:
+**Частичный сбой заказа**
 
 ```bash
-# A всегда 5xx, B всегда ок — смотреть fallback
-curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"fail\"}"
-curl -s -X POST http://localhost:3002/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\"}"
-
-# ловушка таймаута: A выделяет ключ и зависает
-curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"timeout\",\"hang_ms\":15000}"
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\",\"fail_skus\":[\"KEY-EFT\"]}"
+curl -s -X POST http://localhost:3002/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"ok\",\"fail_skus\":[\"KEY-EFT\"]}"
+# заказ из STEAM-TOPUP-2500 + KEY-EFT → оплата → partially_fulfilled
 ```
 
-## Ключевые решения
+**Недобросовестный поставщик**
 
-**Exactly-once оплаты.** `payment_events.event_id` — PK (повтор вебхука — no-op). Все мутации заказа сериализуются через `GET_LOCK(ord:{id})` + `SELECT … FOR UPDATE`. Переход `created → paid` делается одним `UPDATE … WHERE status='created'`. 50 параллельных вебхуков выстраиваются в очередь по замку; выдачу запускает только победитель.
+```bash
+# выдал, но ответил 503
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"lie_error\"}"
 
-**Вебхук раньше заказа.** Событие пишется в `payment_events` с `processed=0`. Создание заказа берёт тот же lock, находит необработанные события и применяет их. Обратный порядок (`failed` после `paid`/`delivered`) игнорируется.
+# отдать код из чужого заказа
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"duplicate_code\"}"
 
-**Ловушка таймаута.** `request_id` стабилен на заказ+поставщика (`req_{orderId}-A`). Заглушка **сначала выделяет ключ и коммитит**, потом может зависнуть. Повтор с тем же id возвращает тот же код и не висит. Таймаут **не считается отказом** и **не включает fallback** — иначе получим два кода. Fallback A→B только на явный 4xx/5xx без аллокации.
+# ловушка таймаута (allocate, потом hang) — массовый заказ из нескольких sku
+curl -s -X POST http://localhost:3001/admin/config -H "Content-Type: application/json" -d "{\"force_mode\":\"timeout\",\"hang_ms\":20000}"
+```
 
-**Идемпотентность выдачи.** `supplier_issues.request_id` PK, `inventory_keys.code` UNIQUE, `orders.delivery_code` UNIQUE. Повторный `UPDATE … WHERE delivery_code IS NULL` не затрёт финальный заказ.
+**Деньги сходятся**
 
-**Очередь.** Отдельный брокер не нужен для объёма тестового ядра: `setImmediate` после оплаты + воркер раз в 3 с дожимает `paid` / `delivering` / `out_of_stock` / `delivery_failed` по `next_retry_at`.
+```bash
+curl -s http://localhost:3000/api/reconcile
+# ok=true, ledger.balanced, money_mismatch=[]
+# у заказа: money.outstanding === 0  ⇔  paid = delivered + refunded
+```
 
-**Леджер.** Двойная запись: оплата `Dr cash / Cr prepaid`, выдача `Dr prepaid / Cr revenue`. Идемпотентность `UNIQUE(order_id, account, direction)`. Сверка: `GET /api/reconcile`.
+Повтор оплаты, retry-delivery и рестарт в середине выдачи не создают второй код и второй возврат: `claimed_codes.code` UNIQUE, леджер `INSERT IGNORE` по `(order_id, item_id, event_type, account, direction)`, поставщику всегда тот же `request_id`.
 
-**Витрина (этап 5).** `stock` денормализован на `products`, generated `in_stock AS (stock > 0)` + индекс `idx_vitrine (in_stock, sku)`. При почти полном наличии оптимизатор берёт `PRIMARY(sku) + LIMIT` (~50 rows, Using where). `idx_vitrine` срабатывает, когда много нулевых остатков или большой OFFSET. План: `GET /api/catalog/explain`.
+## Ключевые решения этапа 2
 
+**Позиции, не «заказ = один ключ». ** Выдача и возврат идут по `order_items`. Терминал заказа: `delivered` / `partially_fulfilled` / `refunded`. Невыданное возвращается в cash, выданное остаётся у покупателя.
 
+**Ответу поставщика не верим.** Тело HTTP — подсказка. Источник истины: строка в `supplier_issues` по стабильному `request_id` (тот же контракт, что status API поставщика). Код принимаем только после `INSERT INTO claimed_codes` (PK по коду). Чужой/повторный код отвергаем и не отдаём второму покупателю; если A соврал — fallback на B с **другим** request_id.
+
+**Падение после выдачи.** Таймаут ≠ отказ и ≠ fallback. После abort смотрим allocate; если ключ уже есть — забираем. Рестарт дожимает воркер раз в 3 с, тот же `request_id`.
+
+**Очередь и RPM.** Поставщик сам режет `rate_limit_rpm` (429). Оплаченные позиции ждут `next_retry_at`, неоплаченные в выдачу не попадают. Прогресс: `GET /api/queue`.
+
+**История только append.** `order_events` + леджер без UPDATE задним числом. `GET /api/orders/:id/at?at=` и `GET /api/money/at?at=`.

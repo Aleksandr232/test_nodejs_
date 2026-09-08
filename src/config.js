@@ -17,6 +17,7 @@ export const config = {
     B: process.env.SUPPLIER_B_URL || "http://127.0.0.1:3002",
     timeoutMs: Number(process.env.SUPPLIER_TIMEOUT_MS || 2500),
     retries: Number(process.env.SUPPLIER_RETRIES || 3),
+    rateLimitRpm: Number(process.env.SUPPLIER_RATE_LIMIT_RPM || 0),
   },
   logLevel: process.env.LOG_LEVEL || "info",
   catalogExtraSkus: Number(process.env.CATALOG_EXTRA_SKUS || 2500),

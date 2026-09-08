@@ -1,23 +1,33 @@
 import { pool, withOrderLock } from "../db.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { ledgerDelivery } from "./ledger.js";
+import { ledgerDelivery, ledgerRefund } from "./ledger.js";
+import { appendEvent } from "./events.js";
 
-const RECOVERABLE = new Set(["paid", "delivering", "out_of_stock", "delivery_failed"]);
+const ITEM_RECOVERABLE = new Set(["pending", "delivering", "out_of_stock", "delivery_failed"]);
+const ORDER_PAYING = new Set(["paid", "delivering", "out_of_stock", "delivery_failed", "partially_fulfilled"]);
+const MAX_FAIL_ATTEMPTS = 5;
 
-// TODO(explain): sleep — backoff между retry timeout, не между 5xx (там сразу fallback).
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// TODO(explain): maskCode — полный ключ не должен попасть в JSON-логи.
 function maskCode(code) {
   if (!code || code.length < 4) return "***";
   return `***${code.slice(-4)}`;
 }
 
-// TODO(explain): callSupplier — AbortController = наш таймаут; timeout отделяем от 5xx,
-// иначе ловушка «поставщик выдал, ответ не дошёл» неотличима от отказа.
+async function acquireRateSlot(supplier) {
+  const rpm = config.suppliers.rateLimitRpm;
+  if (rpm <= 0) return true;
+  const [[{ cnt }]] = await pool.execute(
+    `SELECT COUNT(*) AS cnt FROM supplier_call_log
+     WHERE supplier = ? AND called_at > DATE_SUB(NOW(3), INTERVAL 60 SECOND)`,
+    [supplier]
+  );
+  return Number(cnt) < rpm;
+}
+
 async function callSupplier(baseUrl, body, timeoutMs) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -29,6 +39,9 @@ async function callSupplier(baseUrl, body, timeoutMs) {
       signal: ac.signal,
     });
     const json = await res.json().catch(() => ({}));
+    if (res.status === 429) {
+      return { kind: "rate_limited", reason: json.reason || "rate_limited" };
+    }
     if (res.ok && json.status === "ok" && json.code) {
       return { kind: "ok", code: json.code, request_id: json.request_id };
     }
@@ -47,45 +60,63 @@ async function callSupplier(baseUrl, body, timeoutMs) {
   }
 }
 
-/**
- * Retry the SAME request_id. Never mint a new id after timeout —
- * the supplier may have already allocated a code.
- * TODO(explain): callWithRetry — timeout → backoff + тот же request_id;
- * явный error → return (можно fallback). Новый id после timeout = второй ключ.
- */
+async function findAllocated(requestId) {
+  const [rows] = await pool.execute(
+    "SELECT request_id, supplier, sku, order_id, code FROM supplier_issues WHERE request_id = ?",
+    [requestId]
+  );
+  return rows[0] || null;
+}
+
 async function callWithRetry(name, baseUrl, body) {
   const retries = config.suppliers.retries;
   const timeoutMs = config.suppliers.timeoutMs;
   let last = null;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
+    const slot = await acquireRateSlot(name);
+    if (!slot) {
+      logger.warn({ event: "fulfillment.rate_limited", supplier: name, request_id: body.request_id });
+      return { kind: "rate_limited" };
+    }
+
     logger.info({
       event: "fulfillment.supplier_call",
       supplier: name,
       order_id: body.order_id,
+      item_id: body.item_id,
       request_id: body.request_id,
       attempt,
     });
 
     last = await callSupplier(baseUrl, body, timeoutMs);
 
-    if (last.kind === "ok") {
+    const allocated = await findAllocated(body.request_id);
+    if (allocated?.code) {
       logger.info({
-        event: "fulfillment.supplier_ok",
+        event: "fulfillment.allocation_confirmed",
         supplier: name,
-        order_id: body.order_id,
         request_id: body.request_id,
-        code: maskCode(last.code),
-        attempt,
+        code: maskCode(allocated.code),
+        http_kind: last.kind,
       });
-      return last;
+      return { kind: "ok", code: allocated.code, request_id: body.request_id, via: "reconcile" };
+    }
+
+    if (last.kind === "ok") {
+      logger.warn({
+        event: "fulfillment.untrusted_code_ignored",
+        supplier: name,
+        request_id: body.request_id,
+        note: "http_ok_but_no_allocation_for_request_id",
+      });
+      return { kind: "error", reason: "untrusted_code" };
     }
 
     if (last.kind === "timeout") {
       logger.warn({
         event: "fulfillment.supplier_timeout",
         supplier: name,
-        order_id: body.order_id,
         request_id: body.request_id,
         attempt,
         note: "timeout_is_not_failure_retry_same_request_id",
@@ -94,10 +125,13 @@ async function callWithRetry(name, baseUrl, body) {
       continue;
     }
 
+    if (last.kind === "rate_limited") {
+      return last;
+    }
+
     logger.warn({
       event: "fulfillment.supplier_error",
       supplier: name,
-      order_id: body.order_id,
       request_id: body.request_id,
       reason: last.reason,
       attempt,
@@ -105,181 +139,438 @@ async function callWithRetry(name, baseUrl, body) {
     return last;
   }
 
+  const allocated = await findAllocated(body.request_id);
+  if (allocated?.code) {
+    return { kind: "ok", code: allocated.code, request_id: body.request_id, via: "reconcile" };
+  }
   return last;
 }
 
-// TODO(explain): completeDelivery — WHERE delivery_code IS NULL; леджер в той же транзакции.
-async function completeDelivery(conn, order, code, supplier, requestId) {
-  const [upd] = await conn.execute(
+async function claimCode(conn, { code, orderId, itemId, requestId, supplier }) {
+  try {
+    await conn.execute(
+      `INSERT INTO claimed_codes (code, order_id, item_id, request_id, supplier)
+       VALUES (?, ?, ?, ?, ?)`,
+      [code, orderId, itemId, requestId, supplier]
+    );
+    return { ok: true };
+  } catch (e) {
+    if (e.code !== "ER_DUP_ENTRY") throw e;
+    const [byItem] = await conn.execute("SELECT * FROM claimed_codes WHERE item_id = ?", [itemId]);
+    if (byItem[0]) {
+      return { ok: true, existing: true, code: byItem[0].code, supplier: byItem[0].supplier };
+    }
+    const [byCode] = await conn.execute("SELECT * FROM claimed_codes WHERE code = ?", [code]);
+    logger.warn({
+      event: "fulfillment.code_rejected",
+      order_id: orderId,
+      item_id: itemId,
+      request_id: requestId,
+      owner_item: byCode[0]?.item_id,
+      owner_order: byCode[0]?.order_id,
+      note: "supplier_duplicate_or_stolen_code",
+    });
+    return { ok: false, reason: "code_already_claimed", owner: byCode[0] };
+  }
+}
+
+async function rollupOrder(conn, orderId) {
+  const [items] = await conn.execute("SELECT * FROM order_items WHERE order_id = ? ORDER BY line_no", [orderId]);
+  if (!items.length) return;
+
+  const delivered = items.filter((i) => i.status === "delivered");
+  const refunded = items.filter((i) => i.status === "refunded");
+  const pending = items.filter((i) => !["delivered", "refunded"].includes(i.status));
+
+  let status;
+  if (pending.length) {
+    if (pending.every((i) => i.status === "out_of_stock")) status = "out_of_stock";
+    else if (pending.every((i) => i.status === "delivery_failed" || i.status === "out_of_stock")) status = "delivery_failed";
+    else status = "delivering";
+  } else if (delivered.length && refunded.length) status = "partially_fulfilled";
+  else if (delivered.length) status = "delivered";
+  else status = "refunded";
+
+  const single = items.length === 1 && delivered.length === 1;
+  await conn.execute(
     `UPDATE orders
+     SET status = ?,
+         delivery_code = ?,
+         supplier_used = ?,
+         request_id = ?,
+         delivered_at = CASE WHEN ? IN ('delivered','partially_fulfilled') THEN COALESCE(delivered_at, NOW(3)) ELSE delivered_at END,
+         updated_at = NOW(3),
+         next_retry_at = CASE WHEN ? = 'delivering' THEN DATE_ADD(NOW(3), INTERVAL 2 SECOND) ELSE NULL END,
+         last_error = ?,
+         lock_until = NULL
+     WHERE id = ? AND status NOT IN ('created','payment_failed')`,
+    [
+      status,
+      single ? delivered[0].delivery_code : null,
+      single ? delivered[0].supplier_used : delivered[0]?.supplier_used || null,
+      single ? delivered[0].request_id : items[0].request_id,
+      status,
+      status,
+      pending[0]?.last_error || null,
+      orderId,
+    ]
+  );
+
+  await appendEvent(conn, {
+    orderId,
+    eventType: "order.status",
+    payload: {
+      status,
+      delivered: delivered.length,
+      refunded: refunded.length,
+      pending: pending.length,
+    },
+  });
+}
+
+async function completeItem(conn, item, code, supplier, requestId) {
+  const claimed = await claimCode(conn, {
+    code,
+    orderId: item.order_id,
+    itemId: item.id,
+    requestId,
+    supplier,
+  });
+  if (!claimed.ok) return { delivered: false, reason: claimed.reason };
+  const finalCode = claimed.code || code;
+  const finalSupplier = claimed.supplier || supplier;
+
+  const [upd] = await conn.execute(
+    `UPDATE order_items
      SET status = 'delivered',
          delivery_code = ?,
          supplier_used = ?,
          request_id = ?,
          delivered_at = NOW(3),
-         updated_at = NOW(3),
          next_retry_at = NULL,
-         last_error = NULL,
-         lock_until = NULL
-     WHERE id = ? AND status IN ('paid','delivering','out_of_stock','delivery_failed')
-       AND delivery_code IS NULL`,
-    [code, supplier, requestId, order.id]
+         lock_until = NULL,
+         last_error = NULL
+     WHERE id = ? AND delivery_code IS NULL
+       AND status IN ('pending','delivering','out_of_stock','delivery_failed')`,
+    [finalCode, finalSupplier, requestId, item.id]
   );
-
   if (upd.affectedRows === 0) {
-    logger.info({ event: "fulfillment.already_delivered", order_id: order.id });
-    return false;
+    await rollupOrder(conn, item.order_id);
+    return { delivered: true, existing: true };
   }
 
-  await ledgerDelivery(conn, order.id, order.amount);
+  await ledgerDelivery(conn, item.order_id, item.id, item.amount);
+  await appendEvent(conn, {
+    orderId: item.order_id,
+    itemId: item.id,
+    eventType: "item.delivered",
+    payload: {
+      sku: item.sku,
+      amount: Number(item.amount),
+      supplier: finalSupplier,
+      code: finalCode,
+    },
+  });
+  await rollupOrder(conn, item.order_id);
   logger.info({
-    event: "fulfillment.delivered",
-    order_id: order.id,
-    supplier,
+    event: "fulfillment.item_delivered",
+    order_id: item.order_id,
+    item_id: item.id,
+    supplier: finalSupplier,
     request_id: requestId,
-    code: maskCode(code),
+    code: maskCode(finalCode),
+  });
+  return { delivered: true };
+}
+
+async function refundItem(conn, item, reason) {
+  const [upd] = await conn.execute(
+    `UPDATE order_items
+     SET status = 'refunded',
+         refunded_at = NOW(3),
+         next_retry_at = NULL,
+         lock_until = NULL,
+         last_error = ?,
+         fulfillment_attempts = fulfillment_attempts + 1
+     WHERE id = ? AND status NOT IN ('delivered','refunded')`,
+    [(reason || "refunded").slice(0, 255), item.id]
+  );
+  if (upd.affectedRows === 0) {
+    await rollupOrder(conn, item.order_id);
+    return false;
+  }
+  await ledgerRefund(conn, item.order_id, item.id, item.amount);
+  await appendEvent(conn, {
+    orderId: item.order_id,
+    itemId: item.id,
+    eventType: "item.refunded",
+    payload: { sku: item.sku, amount: Number(item.amount), reason },
+  });
+  await rollupOrder(conn, item.order_id);
+  logger.info({
+    event: "fulfillment.item_refunded",
+    order_id: item.order_id,
+    item_id: item.id,
+    amount: Number(item.amount),
+    reason,
   });
   return true;
 }
 
-// TODO(explain): markRecoverable — out_of_stock/delivery_failed не crash; next_retry_at глушит busy-loop.
-async function markRecoverable(conn, orderId, status, error) {
-  const delaySec = status === "out_of_stock" ? 15 : 5;
+async function markItem(conn, item, status, error, delaySecOverride) {
+  const delaySec = delaySecOverride ?? (status === "out_of_stock" ? 15 : status === "delivery_failed" ? 5 : 2);
   await conn.execute(
-    `UPDATE orders
+    `UPDATE order_items
      SET status = ?,
          last_error = ?,
          fulfillment_attempts = fulfillment_attempts + 1,
-         updated_at = NOW(3),
          lock_until = NULL,
          next_retry_at = DATE_ADD(NOW(3), INTERVAL ? SECOND)
-     WHERE id = ? AND status IN ('paid','delivering','out_of_stock','delivery_failed')`,
-    [status, error?.slice(0, 255) || status, delaySec, orderId]
+     WHERE id = ? AND status NOT IN ('delivered','refunded')`,
+    [status, (error || status).slice(0, 255), delaySec, item.id]
   );
+  await appendEvent(conn, {
+    orderId: item.order_id,
+    itemId: item.id,
+    eventType: "item.status",
+    payload: { status, error },
+  });
+  await rollupOrder(conn, item.order_id);
 }
 
-// TODO(explain): fulfillOrder — HTTP вне транзакции; timeout A ≠ fallback B;
-// B только на 4xx/5xx и со своим request_id-B.
-export async function fulfillOrder(orderId) {
+async function adoptExistingClaim(conn, item) {
+  const [claimed] = await conn.execute("SELECT * FROM claimed_codes WHERE item_id = ?", [item.id]);
+  if (claimed[0]) {
+    await completeItem(conn, item, claimed[0].code, claimed[0].supplier, claimed[0].request_id);
+    return true;
+  }
+  if (item.delivery_code) {
+    await completeItem(conn, item, item.delivery_code, item.supplier_used || "A", item.request_id);
+    return true;
+  }
+  return false;
+}
+
+export async function fulfillItem(itemId) {
+  const [found] = await pool.execute("SELECT order_id FROM order_items WHERE id = ?", [itemId]);
+  if (!found[0]) return { skip: true, reason: "missing_item" };
+  const orderId = found[0].order_id;
+
   const claimed = await withOrderLock(orderId, async (conn) => {
-    const [rows] = await conn.execute("SELECT * FROM orders WHERE id = ? FOR UPDATE", [orderId]);
-    const order = rows[0];
-    if (!order) return null;
-    if (order.status === "delivered") return { skip: true, reason: "already_delivered" };
-    if (!RECOVERABLE.has(order.status)) return { skip: true, reason: order.status };
-    if (
-      order.status === "delivering" &&
-      order.lock_until &&
-      new Date(order.lock_until).getTime() > Date.now()
-    ) {
+    const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [itemId]);
+    const item = rows[0];
+    if (!item) return { skip: true, reason: "missing_item" };
+
+    const [orders] = await conn.execute("SELECT * FROM orders WHERE id = ? FOR UPDATE", [item.order_id]);
+    const order = orders[0];
+    if (!order || !ORDER_PAYING.has(order.status)) return { skip: true, reason: order?.status || "no_order" };
+    if (!ITEM_RECOVERABLE.has(item.status)) return { skip: true, reason: item.status };
+
+    if (item.status === "delivering" && item.lock_until && new Date(item.lock_until).getTime() > Date.now()) {
       return { skip: true, reason: "in_flight" };
     }
-    if (order.delivery_code) {
-      await completeDelivery(conn, order, order.delivery_code, order.supplier_used || "A", order.request_id);
+
+    if (await adoptExistingClaim(conn, item)) {
       return { skip: true, reason: "had_code" };
     }
 
+    const allocatedA = await findAllocated(`req_${item.id}-A`);
+    const allocatedB = await findAllocated(`req_${item.id}-B`);
+    const allocated = allocatedA || allocatedB;
+    if (allocated?.code) {
+      const done = await completeItem(conn, item, allocated.code, allocated.supplier, allocated.request_id);
+      if (done.delivered) return { skip: true, reason: "reconciled" };
+    }
+
     await conn.execute(
-      `UPDATE orders
+      `UPDATE order_items
        SET status = 'delivering',
-           lock_until = DATE_ADD(NOW(3), INTERVAL 45 SECOND),
-           updated_at = NOW(3)
+           lock_until = DATE_ADD(NOW(3), INTERVAL 45 SECOND)
        WHERE id = ?`,
-      [orderId]
+      [item.id]
     );
-    return { order };
+    await conn.execute(
+      `UPDATE orders SET status = 'delivering', lock_until = DATE_ADD(NOW(3), INTERVAL 45 SECOND), updated_at = NOW(3)
+       WHERE id = ? AND status IN ('paid','delivering','out_of_stock','delivery_failed')`,
+      [item.order_id]
+    );
+    return { item };
   });
 
   if (!claimed || claimed.skip) return claimed;
 
-  const order = claimed.order;
-  const requestIdA = `req_${order.id}-A`;
-
+  const item = claimed.item;
+  const requestIdA = `req_${item.id}-A`;
   const resultA = await callWithRetry("A", config.suppliers.A, {
     request_id: requestIdA,
-    sku: order.sku,
-    order_id: order.id,
+    sku: item.sku,
+    order_id: item.order_id,
+    item_id: item.id,
   });
 
   if (resultA.kind === "ok") {
-    await withOrderLock(orderId, async (conn) => {
-      const [rows] = await conn.execute("SELECT * FROM orders WHERE id = ? FOR UPDATE", [orderId]);
-      if (!rows[0] || rows[0].status === "delivered") return;
-      await completeDelivery(conn, rows[0], resultA.code, "A", requestIdA);
+    const applied = await withOrderLock(item.order_id, async (conn) => {
+      const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+      if (!rows[0] || rows[0].status === "delivered" || rows[0].status === "refunded") return { delivered: true };
+      return completeItem(conn, rows[0], resultA.code, "A", requestIdA);
     });
-    return { delivered: true, supplier: "A" };
+    if (applied.delivered) return { delivered: true, supplier: "A", item_id: item.id };
+    resultA.kind = "error";
+    resultA.reason = applied.reason || "code_already_claimed";
   }
 
   if (resultA.kind === "timeout") {
-    // Do NOT fallback: A may already hold a code for this request_id.
-    logger.warn({
-      event: "fulfillment.timeout_no_fallback",
-      order_id: orderId,
-      request_id: requestIdA,
+    logger.warn({ event: "fulfillment.timeout_no_fallback", order_id: item.order_id, item_id: item.id, request_id: requestIdA });
+    await withOrderLock(item.order_id, async (conn) => {
+      const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+      if (!rows[0] || rows[0].status === "delivered") return;
+      const allocated = await findAllocated(requestIdA);
+      if (allocated?.code) {
+        await completeItem(conn, rows[0], allocated.code, "A", requestIdA);
+        return;
+      }
+      await markItem(conn, rows[0], "delivery_failed", "supplier_A_timeout");
     });
-    await withOrderLock(orderId, async (conn) => {
-      await markRecoverable(conn, orderId, "delivery_failed", "supplier_A_timeout");
+    return { failed: true, reason: "timeout", item_id: item.id };
+  }
+
+  if (resultA.kind === "rate_limited") {
+    await withOrderLock(item.order_id, async (conn) => {
+      const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+      if (rows[0]) await markItem(conn, rows[0], "delivering", "rate_limited", 8);
     });
-    return { failed: true, reason: "timeout" };
+    return { failed: true, reason: "rate_limited", item_id: item.id };
   }
 
   logger.info({
     event: "fulfillment.fallback",
-    order_id: orderId,
+    order_id: item.order_id,
+    item_id: item.id,
     from: "A",
     to: "B",
     reason: resultA.reason,
   });
 
-  const requestIdB = `req_${order.id}-B`;
+  const requestIdB = `req_${item.id}-B`;
   const resultB = await callWithRetry("B", config.suppliers.B, {
     request_id: requestIdB,
-    sku: order.sku,
-    order_id: order.id,
+    sku: item.sku,
+    order_id: item.order_id,
+    item_id: item.id,
   });
 
   if (resultB.kind === "ok") {
-    await withOrderLock(orderId, async (conn) => {
-      const [rows] = await conn.execute("SELECT * FROM orders WHERE id = ? FOR UPDATE", [orderId]);
-      if (!rows[0] || rows[0].status === "delivered") return;
-      await completeDelivery(conn, rows[0], resultB.code, "B", requestIdB);
+    const applied = await withOrderLock(item.order_id, async (conn) => {
+      const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+      if (!rows[0] || rows[0].status === "delivered" || rows[0].status === "refunded") return { delivered: true };
+      return completeItem(conn, rows[0], resultB.code, "B", requestIdB);
     });
-    return { delivered: true, supplier: "B" };
+    if (applied.delivered) return { delivered: true, supplier: "B", item_id: item.id };
+    resultB.reason = applied.reason || resultB.reason;
   }
 
-  const stockFail =
-    resultA.reason === "out_of_stock" && (resultB.reason === "out_of_stock" || resultB.kind !== "ok");
-  const status = stockFail ? "out_of_stock" : "delivery_failed";
+  if (resultB.kind === "timeout") {
+    await withOrderLock(item.order_id, async (conn) => {
+      const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+      if (!rows[0] || rows[0].status === "delivered") return;
+      const allocated = await findAllocated(requestIdB);
+      if (allocated?.code) {
+        await completeItem(conn, rows[0], allocated.code, "B", requestIdB);
+        return;
+      }
+      await markItem(conn, rows[0], "delivery_failed", "supplier_B_timeout");
+    });
+    return { failed: true, reason: "timeout", item_id: item.id };
+  }
 
-  await withOrderLock(orderId, async (conn) => {
-    await markRecoverable(conn, orderId, status, resultB.reason || resultA.reason || status);
+  if (resultB.kind === "rate_limited") {
+    await withOrderLock(item.order_id, async (conn) => {
+      const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+      if (rows[0]) await markItem(conn, rows[0], "delivering", "rate_limited", 8);
+    });
+    return { failed: true, reason: "rate_limited", item_id: item.id };
+  }
+
+  const stockFail = resultA.reason === "out_of_stock" && (resultB.reason === "out_of_stock" || resultB.kind !== "ok");
+
+  await withOrderLock(item.order_id, async (conn) => {
+    const [rows] = await conn.execute("SELECT * FROM order_items WHERE id = ? FOR UPDATE", [item.id]);
+    const current = rows[0];
+    if (!current || current.status === "delivered" || current.status === "refunded") return;
+
+    const allocated = (await findAllocated(requestIdA)) || (await findAllocated(requestIdB));
+    if (allocated?.code) {
+      const done = await completeItem(conn, current, allocated.code, allocated.supplier, allocated.request_id);
+      if (done.delivered) return;
+    }
+
+    if (stockFail) {
+      await markItem(conn, current, "out_of_stock", resultB.reason || resultA.reason);
+      return;
+    }
+
+    const stolen = resultA.reason === "code_already_claimed" || resultB.reason === "code_already_claimed";
+    const attempts = Number(current.fulfillment_attempts || 0) + 1;
+    if (stolen || attempts >= MAX_FAIL_ATTEMPTS || (resultA.kind === "error" && resultB.kind !== "ok")) {
+      await refundItem(conn, current, resultB.reason || resultA.reason || "undeliverable");
+      return;
+    }
+    await markItem(conn, current, "delivery_failed", resultB.reason || resultA.reason || "delivery_failed");
   });
 
-  return { failed: true, status };
+  return { failed: true, item_id: item.id };
 }
 
-// TODO(explain): recoverStuckOrders — дожим без брокера; безопасность = идемпотентность, не «один воркер».
+export async function fulfillOrder(orderId) {
+  const [items] = await pool.execute(
+    `SELECT id FROM order_items
+     WHERE order_id = ?
+       AND status IN ('pending','delivering','out_of_stock','delivery_failed')
+     ORDER BY line_no`,
+    [orderId]
+  );
+  if (!items.length) {
+    await withOrderLock(orderId, async (conn) => {
+      await rollupOrder(conn, orderId);
+    });
+    return { skip: true, reason: "no_items" };
+  }
+
+  const results = [];
+  for (const row of items) {
+    try {
+      results.push(await fulfillItem(row.id));
+    } catch (err) {
+      logger.error({ event: "fulfillment.item_error", order_id: orderId, item_id: row.id, err: err.message });
+      results.push({ failed: true, item_id: row.id, error: err.message });
+    }
+  }
+  return { order_id: orderId, results };
+}
+
 export async function recoverStuckOrders() {
   const [rows] = await pool.query(
-    `SELECT id FROM orders
-     WHERE status IN ('paid','delivering','out_of_stock','delivery_failed')
-       AND delivery_code IS NULL
-       AND (next_retry_at IS NULL OR next_retry_at <= NOW(3))
-       AND (lock_until IS NULL OR lock_until <= NOW(3))
-     ORDER BY updated_at ASC
-     LIMIT 10`
+    `SELECT i.id
+     FROM order_items i
+     JOIN orders o ON o.id = i.order_id
+     WHERE i.status IN ('pending','delivering','out_of_stock','delivery_failed')
+       AND i.delivery_code IS NULL
+       AND o.status IN ('paid','delivering','out_of_stock','delivery_failed','partially_fulfilled')
+       AND (i.next_retry_at IS NULL OR i.next_retry_at <= NOW(3))
+       AND (i.lock_until IS NULL OR i.lock_until <= NOW(3))
+     ORDER BY o.paid_at IS NULL, o.paid_at ASC, i.line_no ASC
+     LIMIT 20`
   );
 
   for (const row of rows) {
     try {
-      await fulfillOrder(row.id);
+      await fulfillItem(row.id);
     } catch (err) {
-      logger.error({ event: "recovery.error", order_id: row.id, err: err.message });
+      logger.error({ event: "recovery.error", item_id: row.id, err: err.message });
     }
   }
 }
 
-// TODO(explain): startRecoveryWorker — setInterval ок для ядра; в проде outbox + очередь.
 export function startRecoveryWorker() {
   const tick = async () => {
     try {
@@ -291,4 +582,59 @@ export function startRecoveryWorker() {
   const id = setInterval(tick, 3000);
   if (id.unref) id.unref();
   logger.info({ event: "recovery.started" });
+}
+
+export async function queueStats() {
+  const [[items]] = await pool.query(`
+    SELECT
+      SUM(status IN ('pending','out_of_stock','delivery_failed')) AS queued,
+      SUM(status = 'delivering') AS inflight,
+      SUM(status = 'delivered') AS delivered,
+      SUM(status = 'refunded') AS refunded
+    FROM order_items
+  `);
+  const [[orders]] = await pool.query(`
+    SELECT
+      SUM(status = 'paid') AS paid,
+      SUM(status = 'delivering') AS delivering,
+      SUM(status = 'delivered') AS delivered,
+      SUM(status = 'partially_fulfilled') AS partially_fulfilled,
+      SUM(status = 'refunded') AS refunded
+    FROM orders
+  `);
+  const [rpm] = await pool.query(`
+    SELECT supplier, COUNT(*) AS calls_last_minute
+    FROM supplier_call_log
+    WHERE called_at > DATE_SUB(NOW(3), INTERVAL 60 SECOND)
+    GROUP BY supplier
+  `);
+  const [limits] = await pool.query("SELECT name, rate_limit_rpm FROM supplier_runtime");
+  return {
+    items: {
+      queued: Number(items?.queued || 0),
+      inflight: Number(items?.inflight || 0),
+      delivered: Number(items?.delivered || 0),
+      refunded: Number(items?.refunded || 0),
+    },
+    orders: {
+      paid: Number(orders?.paid || 0),
+      delivering: Number(orders?.delivering || 0),
+      delivered: Number(orders?.delivered || 0),
+      partially_fulfilled: Number(orders?.partially_fulfilled || 0),
+      refunded: Number(orders?.refunded || 0),
+    },
+    suppliers: Object.fromEntries(
+      ["A", "B"].map((name) => {
+        const limit = limits.find((r) => r.name === name);
+        const used = rpm.find((r) => r.supplier === name);
+        return [
+          name,
+          {
+            rpm_limit: Number(limit?.rate_limit_rpm || config.suppliers.rateLimitRpm || 0),
+            calls_last_minute: Number(used?.calls_last_minute || 0),
+          },
+        ];
+      })
+    ),
+  };
 }

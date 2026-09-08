@@ -2,9 +2,18 @@ import { withOrderLock } from "../db.js";
 import { logger } from "../logger.js";
 import { ledgerPayment } from "./ledger.js";
 import { fulfillOrder } from "./fulfillment.js";
+import { appendEvent } from "./events.js";
 
-const FINAL_PAID_STATUSES = new Set(["paid", "delivering", "delivered", "out_of_stock", "delivery_failed"]);
-const FINAL_TERMINAL = new Set(["delivered", "payment_failed"]);
+const FINAL_PAID_STATUSES = new Set([
+  "paid",
+  "delivering",
+  "delivered",
+  "out_of_stock",
+  "delivery_failed",
+  "partially_fulfilled",
+  "refunded",
+]);
+const FINAL_TERMINAL = new Set(["delivered", "payment_failed", "partially_fulfilled", "refunded"]);
 
 // TODO(explain): handlePaymentWebhook — PK event_id = идемпотентность; 200 всегда (кроме 400);
 // заказ отсутствует → pending, не 404 (вебхук раньше create). Выдачу не держать в HTTP.
@@ -139,6 +148,11 @@ export async function applyPaymentEvent(conn, payload) {
     [order_id]
   );
   await ledgerPayment(conn, order_id, order.amount);
+  await appendEvent(conn, {
+    orderId: order_id,
+    eventType: "order.paid",
+    payload: { amount: Number(order.amount), currency: order.currency },
+  });
   await conn.execute("UPDATE payment_events SET processed = 1 WHERE event_id = ?", [event_id]);
 
   logger.info({ event: "payment.captured", event_id, order_id, amount: order.amount });

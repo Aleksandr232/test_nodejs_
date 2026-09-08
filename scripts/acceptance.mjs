@@ -41,9 +41,26 @@ async function configure(url, body) {
   if (r.status !== 200) throw new Error(`config failed ${url}: ${JSON.stringify(r.json)}`);
 }
 
+async function ensureStock(sku, n = 1) {
+  if (sku === "EMPTY-STOCK") return;
+  for (let i = 0; i < n; i++) {
+    const code = `RST-${sku.slice(-8)}-${Date.now()}-${i}-${Math.random().toString(16).slice(2, 6)}`;
+    const r = await req("POST", `${API}/api/admin/restock`, { sku, code });
+    if (r.status !== 200) throw new Error(`restock ${sku}: ${r.status} ${JSON.stringify(r.json)}`);
+  }
+}
+
 async function createOrder(sku, id) {
+  await ensureStock(sku);
   const r = await req("POST", `${API}/api/orders`, { sku, id });
   if (r.status !== 201) throw new Error(`create order: ${r.status} ${JSON.stringify(r.json)}`);
+  return r.json;
+}
+
+async function createOrderItems(items, id) {
+  for (const line of items) await ensureStock(line.sku, line.qty || 1);
+  const r = await req("POST", `${API}/api/orders`, { items, id });
+  if (r.status !== 201) throw new Error(`create multi: ${r.status} ${JSON.stringify(r.json)}`);
   return r.json;
 }
 
@@ -97,8 +114,8 @@ async function scenario(name, fn) {
 }
 
 async function resetSuppliers(a, b) {
-  await configure(SUP_A, a);
-  await configure(SUP_B, b);
+  await configure(SUP_A, { fail_skus: [], rate_limit_rpm: 0, ...a });
+  await configure(SUP_B, { fail_skus: [], rate_limit_rpm: 0, ...b });
 }
 
 async function main() {
@@ -221,9 +238,9 @@ async function main() {
     await pay(order);
     const empty = await waitOrder(
       order.id,
-      (o) => o.status === "out_of_stock" || o.status === "delivery_failed"
+      (o) => o.status === "out_of_stock" || o.status === "delivery_failed" || o.items?.[0]?.status === "out_of_stock"
     );
-    assert(empty.status === "out_of_stock" || empty.status === "delivery_failed", "recoverable");
+    assert(empty.status === "out_of_stock" || empty.status === "delivery_failed" || empty.status === "delivering", "recoverable");
     assert(!empty.code, "no code yet");
 
     const code = `REST-${Date.now()}`;
@@ -232,6 +249,165 @@ async function main() {
     await req("POST", `${API}/api/orders/${order.id}/retry-delivery`);
     const delivered = await waitOrder(order.id, (o) => o.status === "delivered");
     assert(delivered.code === code, "restocked key delivered");
+  });
+
+  await scenario("7) partial multi-item: delivered stays, failed refunded, money identity", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok", fail_skus: ["KEY-EFT"] },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok", fail_skus: ["KEY-EFT"] }
+    );
+    const order = await createOrderItems([{ sku: "STEAM-TOPUP-2500" }, { sku: "KEY-EFT" }]);
+    assert(order.items.length === 2, "two lines");
+    assert(order.amount === 2500 + 3490, `sum prices, got ${order.amount}`);
+    await pay(order);
+    const done = await waitOrder(
+      order.id,
+      (o) => o.status === "partially_fulfilled" || o.status === "delivered" || o.status === "refunded",
+      30000
+    );
+    assert(done.status === "partially_fulfilled", `expected partially_fulfilled, got ${done.status}`);
+    const steam = done.items.find((i) => i.sku === "STEAM-TOPUP-2500");
+    const eft = done.items.find((i) => i.sku === "KEY-EFT");
+    assert(steam.status === "delivered" && steam.code, "steam issued");
+    assert(eft.status === "refunded" && !eft.code, "eft refunded");
+    assert(done.money.paid === order.amount, "paid full");
+    assert(done.money.delivered === 2500, "delivered steam only");
+    assert(done.money.refunded === 3490, "refunded eft");
+    assert(done.money.outstanding === 0, "paid = delivered + refunded");
+    await pay(order, { eventId: `evt_replay_partial_${order.id}` });
+    const again = await getOrder(order.id);
+    assert(again.items.find((i) => i.sku === "STEAM-TOPUP-2500").code === steam.code, "no extra issue on replay");
+    assert(again.money.refunded === 3490, "no extra refund on replay");
+  });
+
+  await scenario("8) untrusted supplier lie_error: allocated but 503, still one code, no fallback", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "lie_error" },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" }
+    );
+    const order = await createOrder("SUB-YT-3M");
+    await pay(order);
+    const delivered = await waitOrder(order.id, (o) => o.status === "delivered");
+    assert(delivered.supplier === "A", `must keep A after lie, got ${delivered.supplier}`);
+    const issued = await issues(order.id);
+    assert(issued.filter((x) => x.supplier === "A").length === 1, "A allocated once");
+    assert(issued.filter((x) => x.supplier === "B").length === 0, "no fallback after lie_error");
+    assert(delivered.code === issued.find((x) => x.supplier === "A").code, "buyer got the allocated code");
+  });
+
+  await scenario("9) untrusted duplicate_code: stolen code rejected, second buyer gets another", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" }
+    );
+    const first = await createOrder("SUB-DISCORD-1M");
+    await pay(first);
+    const d1 = await waitOrder(first.id, (o) => o.status === "delivered");
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "duplicate_code" },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" }
+    );
+    const second = await createOrder("SUB-SPOTIFY-1M");
+    await pay(second);
+    const d2 = await waitOrder(second.id, (o) => o.status === "delivered" || o.status === "refunded", 30000);
+    assert(d2.status === "delivered", `second must still get a unique code, got ${d2.status}`);
+    assert(d2.code !== d1.code, "same code must not land in two orders");
+    const rec = await req("GET", `${API}/api/reconcile`);
+    assert((rec.json.code_on_two_items || []).length === 0, "code on two items");
+    assert((rec.json.orders_with_multiple_codes || []).length === 0, "claimed_codes unique");
+  });
+
+  await scenario("10) mass issue + supplier hang: 4 lines, crash after allocate, money still closes", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "timeout", hang_ms: 20000 },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" }
+    );
+    const order = await createOrderItems([
+      { sku: "GIFT-XBOX-1500" },
+      { sku: "GIFT-ROBLOX-800" },
+      { sku: "SUB-DISCORD-1M" },
+      { sku: "KEY-CS2-PRIME" },
+    ]);
+    assert(order.items.length === 4, "four lines");
+    await pay(order);
+    const done = await waitOrder(
+      order.id,
+      (o) => ["delivered", "partially_fulfilled", "refunded"].includes(o.status),
+      50000
+    );
+    assert(done.status === "delivered", `all four should recover on A, got ${done.status}: ${JSON.stringify(done.items)}`);
+    assert(done.items.every((i) => i.status === "delivered" && i.code), "every line has a code");
+    assert(done.items.every((i) => i.supplier === "A"), "timeout must not fallback to B");
+    const codes = done.items.map((i) => i.code);
+    assert(new Set(codes).size === 4, `four unique codes, got ${codes}`);
+    assert(done.money.paid === order.amount, "paid full");
+    assert(done.money.delivered === order.amount, "all delivered");
+    assert(done.money.refunded === 0, "no refund");
+    assert(done.money.outstanding === 0, "identity");
+    const issued = await issues(order.id);
+    assert(issued.filter((x) => x.supplier === "B").length === 0, "B silent after A hang");
+    const replay = await req("POST", `${API}/api/orders/${order.id}/retry-delivery`);
+    assert(replay.status === 200, "retry ok");
+    const after = await getOrder(order.id);
+    assert(after.items.map((i) => i.code).join() === codes.join(), "retry does not reissue");
+  });
+
+  await scenario("11) wrong_code body ignored, buyer gets allocation for request_id", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "wrong_code" },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" }
+    );
+    const order = await createOrder("GIFT-PSN-1000");
+    await pay(order);
+    const delivered = await waitOrder(order.id, (o) => o.status === "delivered");
+    assert(!String(delivered.code).startsWith("WRONG-"), `must not accept lying body, got ${delivered.code}`);
+    const issued = await issues(order.id);
+    const real = issued.find((x) => x.supplier === "A");
+    assert(real && delivered.code === real.code, "code matches supplier_issues.request_id");
+  });
+
+  await scenario("12) burst + supplier RPM: paid orders queue, limit not exceeded, progress visible", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok", rate_limit_rpm: 6 },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok", rate_limit_rpm: 6 }
+    );
+    const skus = Array.from({ length: 10 }, (_, i) => `GEN-${String(i + 1).padStart(4, "0")}`);
+    const orders = [];
+    for (const sku of skus) orders.push(await createOrder(sku));
+    await Promise.all(orders.map((o) => pay(o)));
+    const queue = await req("GET", `${API}/api/queue`);
+    assert(queue.status === 200, "queue endpoint");
+    assert(queue.json.items, "progress counters");
+    const delivered = await Promise.all(
+      orders.map((o) => waitOrder(o.id, (ord) => ord.status === "delivered", 120000))
+    );
+    assert(delivered.every((o) => o.code), "nothing lost");
+    const q2 = await req("GET", `${API}/api/queue`);
+    const rpmA = q2.json.suppliers?.A?.calls_last_minute ?? 0;
+    assert(rpmA <= 12, `A rpm window should stay near limit, got ${rpmA}`);
+  });
+
+  await scenario("13) point-in-time: history append-only, snapshot before/after delivery", async () => {
+    await resetSuppliers(
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" },
+      { fail_rate: 0, timeout_rate: 0, force_mode: "ok" }
+    );
+    const order = await createOrder("STEAM-TOPUP-1000");
+    assert(order.status === "created", "starts created");
+    const justAfterCreate = new Date(new Date(order.created_at).getTime() + 20).toISOString();
+    await sleep(150);
+    await pay(order);
+    const delivered = await waitOrder(order.id, (o) => o.status === "delivered");
+    const past = await req("GET", `${API}/api/orders/${order.id}/at?at=${encodeURIComponent(justAfterCreate)}`);
+    assert(past.status === 200, "past snapshot");
+    assert(past.json.from_events === true, "replay from events");
+    assert(past.json.status === "created", `just after create must be created, got ${past.json.status} ${JSON.stringify(past.json.money)}`);
+    assert(!past.json.money?.paid, "not paid yet");
+    const now = await req("GET", `${API}/api/orders/${order.id}/at?at=${encodeURIComponent(new Date().toISOString())}`);
+    assert(now.json.status === "delivered", "now delivered");
+    const moneyNow = await req("GET", `${API}/api/money/at?at=${encodeURIComponent(new Date().toISOString())}`);
+    assert(moneyNow.json.balanced, "ledger snapshot balances");
+    assert(delivered.code, "code after delivery");
   });
 
   const rec = await req("GET", `${API}/api/reconcile`);

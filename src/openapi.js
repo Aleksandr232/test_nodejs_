@@ -7,10 +7,10 @@ export const openapi = {
   openapi: "3.0.3",
   info: {
     title: "Digital Goods Store API",
-    version: "1.0.0",
+    version: "2.0.0",
     description:
-      "Ядро магазина цифровых товаров: заказ → вебхук оплаты → exactly-once выдача ключа. " +
-      "Эквайринг и поставщики — заглушки.",
+      "Ядро магазина цифровых товаров: мультипозиционный заказ → вебхук оплаты → exactly-once выдача. " +
+      "Частичный сбой, недобросовестный поставщик, очередь с лимитом RPM. Эквайринг и поставщики — заглушки.",
   },
   servers: [{ url: "/", description: "Этот инстанс" }],
   tags: [
@@ -30,8 +30,10 @@ export const openapi = {
     "/api/orders": {
       post: {
         tags: ["orders"],
-        summary: "Создать заказ по SKU",
-        description: "Опциональный `id` нужен для сценария «вебхук пришёл раньше заказа».",
+        summary: "Создать заказ",
+        description:
+          "Один SKU `{ sku }` или несколько позиций `{ items: [{ sku, qty }] }`. " +
+          "Опциональный `id` нужен для сценария «вебхук пришёл раньше заказа».",
         requestBody: {
           required: true,
           content: {
@@ -53,10 +55,25 @@ export const openapi = {
       get: {
         tags: ["orders"],
         summary: "Получить заказ",
-        description: "`code` отдаётся только в статусе `delivered`.",
+        description: "`code` на верхнем уровне — только однопозиционный `delivered`. Иначе коды в `items[]`.",
         parameters: [{ $ref: "#/components/parameters/OrderId" }],
         responses: {
           200: { description: "Заказ", content: { "application/json": { schema: { $ref: "#/components/schemas/Order" } } } },
+          404: { $ref: "#/components/responses/NotFound" },
+        },
+      },
+    },
+    "/api/orders/{id}/at": {
+      get: {
+        tags: ["orders"],
+        summary: "Состояние заказа на момент времени",
+        description: "Восстанавливается из append-only `order_events`. История не переписывается.",
+        parameters: [
+          { $ref: "#/components/parameters/OrderId" },
+          { name: "at", in: "query", required: true, schema: { type: "string", format: "date-time" } },
+        ],
+        responses: {
+          200: { description: "Снимок заказа" },
           404: { $ref: "#/components/responses/NotFound" },
         },
       },
@@ -154,10 +171,27 @@ export const openapi = {
       get: {
         tags: ["ops"],
         summary: "Сверка",
-        description: "оплачен-не-выдан, выдан-не-оплачен, дубли ключей, баланс леджера.",
+        description:
+          "оплачен-не-выдан, выдан-не-оплачен, дубли ключей, оплачено = выдано + возвращено, баланс леджера.",
         responses: {
           200: { description: "Отчёт сверки", content: { "application/json": { schema: { $ref: "#/components/schemas/ReconcileReport" } } } },
         },
+      },
+    },
+    "/api/queue": {
+      get: {
+        tags: ["ops"],
+        summary: "Очередь выдачи",
+        description: "Сколько позиций в очереди / в полёте / выдано / возвращено, вызовы поставщика за минуту.",
+        responses: { 200: { description: "Счётчики очереди" } },
+      },
+    },
+    "/api/money/at": {
+      get: {
+        tags: ["ops"],
+        summary: "Деньги на момент времени",
+        parameters: [{ name: "at", in: "query", required: true, schema: { type: "string", format: "date-time" } }],
+        responses: { 200: { description: "Снимок леджера" } },
       },
     },
     "/api/admin/restock": {
@@ -194,9 +228,20 @@ export const openapi = {
       Error: { type: "object", properties: { error: { type: "string" } } },
       CreateOrderRequest: {
         type: "object",
-        required: ["sku"],
         properties: {
-          sku: { type: "string", example: "STEAM-TOPUP-500" },
+          sku: { type: "string", example: "STEAM-TOPUP-500", description: "Однопозиционный заказ, как в этапе 1" },
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["sku"],
+              properties: {
+                sku: { type: "string" },
+                qty: { type: "integer", minimum: 1, maximum: 20, default: 1 },
+              },
+            },
+            example: [{ sku: "STEAM-TOPUP-500" }, { sku: "KEY-GTA5" }],
+          },
           id: { type: "string", description: "Опционально, для вебхука до create" },
         },
       },
@@ -209,14 +254,46 @@ export const openapi = {
           currency: { type: "string", example: "RUB" },
           status: {
             type: "string",
-            enum: ["created", "paid", "delivering", "delivered", "payment_failed", "out_of_stock", "delivery_failed"],
+            enum: [
+              "created",
+              "paid",
+              "delivering",
+              "delivered",
+              "payment_failed",
+              "out_of_stock",
+              "delivery_failed",
+              "partially_fulfilled",
+              "refunded",
+            ],
           },
-          code: { type: "string", nullable: true, description: "Только если status=delivered" },
+          code: { type: "string", nullable: true, description: "Только однопозиционный delivered" },
           supplier: { type: "string", nullable: true, enum: ["A", "B"] },
+          items: { type: "array", items: { $ref: "#/components/schemas/OrderItem" } },
+          money: {
+            type: "object",
+            properties: {
+              paid: { type: "number" },
+              delivered: { type: "number" },
+              refunded: { type: "number" },
+              outstanding: { type: "number", description: "paid - delivered - refunded, 0 в терминале" },
+            },
+          },
           created_at: { type: "string" },
           updated_at: { type: "string" },
           paid_at: { type: "string", nullable: true },
           delivered_at: { type: "string", nullable: true },
+          last_error: { type: "string", nullable: true },
+        },
+      },
+      OrderItem: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          sku: { type: "string" },
+          amount: { type: "number" },
+          status: { type: "string" },
+          code: { type: "string", nullable: true },
+          supplier: { type: "string", nullable: true },
           last_error: { type: "string", nullable: true },
         },
       },

@@ -12,7 +12,20 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// TODO(explain): getRuntime — хаос в БД, не в env: тесты переключают force_mode без рестарта контейнера.
+function parseFailSkus(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return String(raw)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+}
+
 async function getRuntime() {
   const [rows] = await pool.execute("SELECT * FROM supplier_runtime WHERE name = ?", [name]);
   if (rows[0]) {
@@ -21,6 +34,8 @@ async function getRuntime() {
       timeout_rate: Number(rows[0].timeout_rate),
       force_mode: rows[0].force_mode || "none",
       hang_ms: Number(rows[0].hang_ms || process.env.HANG_MS || 20000),
+      fail_skus: parseFailSkus(rows[0].fail_skus),
+      rate_limit_rpm: Number(rows[0].rate_limit_rpm || 0),
     };
   }
   return {
@@ -28,11 +43,13 @@ async function getRuntime() {
     timeout_rate: Number(process.env.TIMEOUT_RATE || 0),
     force_mode: process.env.FORCE_MODE || "none",
     hang_ms: Number(process.env.HANG_MS || 20000),
+    fail_skus: [],
+    rate_limit_rpm: 0,
   };
 }
 
-// TODO(explain): pickChaos — fail до аллокации, timeout после; иначе fallback после timeout выдаст второй ключ.
-function pickChaos(runtime) {
+function pickChaos(runtime, sku) {
+  if (runtime.fail_skus.includes(sku)) return "fail";
   if (runtime.force_mode && runtime.force_mode !== "none") return runtime.force_mode;
   const r = Math.random();
   if (r < runtime.fail_rate) return "fail";
@@ -40,7 +57,6 @@ function pickChaos(runtime) {
   return "ok";
 }
 
-// TODO(explain): withRequestLock — параллельный retry того же request_id не должен взять два ключа.
 async function withRequestLock(requestId, fn) {
   const conn = await pool.getConnection();
   const lockName = `req:${requestId}`.slice(0, 64);
@@ -70,7 +86,31 @@ async function withRequestLock(requestId, fn) {
   }
 }
 
-// TODO(explain): getOrAllocate — сначала ищем request_id, потом ключ FOR UPDATE; UNIQUE code + декремент stock в той же tx.
+async function allowRpm(runtime) {
+  const rpm = Number(runtime.rate_limit_rpm || 0);
+  if (rpm <= 0) return true;
+  const conn = await pool.getConnection();
+  const lockName = `rpm:${name}`.slice(0, 64);
+  try {
+    await conn.query("SELECT GET_LOCK(?, 5) AS acquired", [lockName]);
+    const [[{ cnt }]] = await conn.execute(
+      `SELECT COUNT(*) AS cnt FROM supplier_call_log
+       WHERE supplier = ? AND called_at > DATE_SUB(NOW(3), INTERVAL 60 SECOND)`,
+      [name]
+    );
+    if (Number(cnt) >= rpm) return false;
+    await conn.execute("INSERT INTO supplier_call_log (supplier) VALUES (?)", [name]);
+    return true;
+  } finally {
+    try {
+      await conn.query("SELECT RELEASE_LOCK(?)", [lockName]);
+    } catch {
+      /* ignore */
+    }
+    conn.release();
+  }
+}
+
 async function getOrAllocate(requestId, sku, orderId) {
   return withRequestLock(requestId, async (conn) => {
     const [existing] = await conn.execute(
@@ -120,8 +160,34 @@ async function getOrAllocate(requestId, sku, orderId) {
   });
 }
 
+async function allocateDuplicate(requestId, sku, orderId) {
+  return withRequestLock(requestId, async (conn) => {
+    const [existing] = await conn.execute(
+      "SELECT * FROM supplier_issues WHERE request_id = ? FOR UPDATE",
+      [requestId]
+    );
+    if (existing[0]) {
+      return { existing: true, code: existing[0].code, request_id: requestId };
+    }
+
+    const [stolen] = await conn.execute(
+      `SELECT code FROM supplier_issues WHERE supplier = ? AND request_id <> ? LIMIT 1`,
+      [name, requestId]
+    );
+    if (!stolen[0]) {
+      return { fallbackAllocate: true };
+    }
+
+    await conn.execute(
+      `INSERT INTO supplier_issues (request_id, supplier, sku, order_id, code)
+       VALUES (?, ?, ?, ?, ?)`,
+      [requestId, name, sku, orderId, stolen[0].code]
+    );
+    return { existing: false, code: stolen[0].code, request_id: requestId, duplicate: true };
+  });
+}
+
 async function main() {
-  // TODO(explain): supplier main — waitForCatalog, не свой seed; иначе два контейнера дерут пул.
   await waitForMysql();
   await migrate();
   await waitForCatalog();
@@ -143,18 +209,22 @@ async function main() {
     const timeout_rate = req.body.timeout_rate ?? 0;
     const force_mode = req.body.force_mode || "none";
     const hang_ms = req.body.hang_ms ?? Number(process.env.HANG_MS || 20000);
+    const fail_skus = req.body.fail_skus ? JSON.stringify(req.body.fail_skus) : null;
+    const rate_limit_rpm = req.body.rate_limit_rpm ?? 0;
     await pool.execute(
-      `INSERT INTO supplier_runtime (name, fail_rate, timeout_rate, force_mode, hang_ms)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO supplier_runtime (name, fail_rate, timeout_rate, force_mode, hang_ms, fail_skus, rate_limit_rpm)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
          fail_rate = VALUES(fail_rate),
          timeout_rate = VALUES(timeout_rate),
          force_mode = VALUES(force_mode),
-         hang_ms = VALUES(hang_ms)`,
-      [name, fail_rate, timeout_rate, force_mode, hang_ms]
+         hang_ms = VALUES(hang_ms),
+         fail_skus = VALUES(fail_skus),
+         rate_limit_rpm = VALUES(rate_limit_rpm)`,
+      [name, fail_rate, timeout_rate, force_mode, hang_ms, fail_skus, rate_limit_rpm]
     );
-    logger.info({ event: "supplier.config", supplier: name, fail_rate, timeout_rate, force_mode });
-    res.json({ ok: true, name, fail_rate, timeout_rate, force_mode, hang_ms });
+    logger.info({ event: "supplier.config", supplier: name, fail_rate, timeout_rate, force_mode, rate_limit_rpm, fail_skus });
+    res.json({ ok: true, name, fail_rate, timeout_rate, force_mode, hang_ms, fail_skus: req.body.fail_skus || [], rate_limit_rpm });
   });
 
   app.get("/admin/issues", async (req, res) => {
@@ -166,11 +236,14 @@ async function main() {
     res.json({ issues: rows });
   });
 
-  /**
-   * Timeout trap: allocate the key FIRST, then optionally hang.
-   * Retry with the same request_id returns the same code and does not hang.
-   * TODO(explain): POST /issue — fail без аллокации; timeout после commit; idempotent hit без hang.
-   */
+  app.get("/issue/:request_id", async (req, res) => {
+    const [rows] = await pool.execute("SELECT request_id, supplier, sku, order_id, code FROM supplier_issues WHERE request_id = ?", [
+      req.params.request_id,
+    ]);
+    if (!rows[0]) return res.status(404).json({ status: "error", reason: "not_found" });
+    res.json({ status: "ok", ...rows[0] });
+  });
+
   app.post("/issue", async (req, res) => {
     const { request_id, sku, order_id } = req.body || {};
     if (!request_id || !sku || !order_id) {
@@ -178,30 +251,52 @@ async function main() {
     }
 
     try {
-      const [already] = await pool.execute(
-        "SELECT code FROM supplier_issues WHERE request_id = ?",
-        [request_id]
-      );
+      const [already] = await pool.execute("SELECT code FROM supplier_issues WHERE request_id = ?", [request_id]);
       if (already[0]) {
         logger.info({ event: "supplier.idempotent_hit", supplier: name, request_id, order_id });
         return res.json({ status: "ok", request_id, code: already[0].code });
       }
 
       const runtime = await getRuntime();
-      const chaos = pickChaos(runtime);
+      if (!(await allowRpm(runtime))) {
+        logger.warn({ event: "supplier.rate_limited", supplier: name, request_id, rpm: runtime.rate_limit_rpm });
+        return res.status(429).json({ status: "error", reason: "rate_limited" });
+      }
+
+      const chaos = pickChaos(runtime, sku);
 
       if (chaos === "fail") {
-        logger.info({ event: "supplier.forced_fail", supplier: name, request_id, order_id });
+        logger.info({ event: "supplier.forced_fail", supplier: name, request_id, order_id, sku });
         return res.status(503).json({ status: "error", reason: "unavailable" });
       }
       if (chaos === "out_of_stock") {
         return res.status(409).json({ status: "error", reason: "out_of_stock" });
       }
 
-      const issued = await getOrAllocate(request_id, sku, order_id);
+      let issued;
+      if (chaos === "duplicate_code") {
+        issued = await allocateDuplicate(request_id, sku, order_id);
+        if (issued.fallbackAllocate) {
+          issued = await getOrAllocate(request_id, sku, order_id);
+        }
+      } else {
+        issued = await getOrAllocate(request_id, sku, order_id);
+      }
+
       if (issued.outOfStock) {
         logger.info({ event: "supplier.out_of_stock", supplier: name, request_id, sku, order_id });
         return res.status(409).json({ status: "error", reason: "out_of_stock" });
+      }
+
+      if (chaos === "lie_error") {
+        logger.warn({ event: "supplier.lie_error", supplier: name, request_id, order_id, note: "allocated_but_http_error" });
+        return res.status(503).json({ status: "error", reason: "unavailable" });
+      }
+
+      if (chaos === "wrong_code") {
+        const fake = `WRONG-${request_id.slice(-8)}`;
+        logger.warn({ event: "supplier.wrong_code", supplier: name, request_id, order_id });
+        return res.json({ status: "ok", request_id, code: fake });
       }
 
       if (chaos === "timeout") {

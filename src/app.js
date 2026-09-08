@@ -3,11 +3,12 @@ import swaggerUi from "swagger-ui-express";
 import pinoHttp from "pino-http";
 import { logger } from "./logger.js";
 import { openapi } from "./openapi.js";
-import { createOrder, getOrder } from "./services/orders.js";
+import { createOrder, getOrder, getOrderAt } from "./services/orders.js";
 import { handlePaymentWebhook } from "./services/payments.js";
 import { listStorefront, getProduct, explainStorefront } from "./services/catalog.js";
-import { reconcile } from "./services/reconcile.js";
+import { reconcile, moneyAt } from "./services/reconcile.js";
 import { restock, retryDelivery } from "./services/admin.js";
+import { queueStats } from "./services/fulfillment.js";
 
 // TODO(explain): createApp — тонкий HTTP-слой, деньги/выдача живут в services.
 // Swagger статическим spec, чтобы контракт вебхука не разъехался с комментариями в коде.
@@ -34,9 +35,10 @@ export function createApp() {
   // TODO(explain): POST /api/orders — 201; бизнес-логика в createOrder, тут только валидация sku.
   app.post("/api/orders", async (req, res, next) => {
     try {
-      const sku = req.body?.sku;
-      if (!sku) return res.status(400).json({ error: "sku_required" });
-      const order = await createOrder({ sku, id: req.body.id });
+      if (!req.body?.sku && !Array.isArray(req.body?.items)) {
+        return res.status(400).json({ error: "sku_or_items_required" });
+      }
+      const order = await createOrder(req.body || {});
       res.status(201).json(order);
     } catch (e) {
       next(e);
@@ -46,6 +48,17 @@ export function createApp() {
   app.get("/api/orders/:id", async (req, res, next) => {
     try {
       const order = await getOrder(req.params.id);
+      if (!order) return res.status(404).json({ error: "not_found" });
+      res.json(order);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get("/api/orders/:id/at", async (req, res, next) => {
+    try {
+      const at = req.query.at || new Date().toISOString();
+      const order = await getOrderAt(req.params.id, at);
       if (!order) return res.status(404).json({ error: "not_found" });
       res.json(order);
     } catch (e) {
@@ -102,6 +115,23 @@ export function createApp() {
   app.get("/api/reconcile", async (_req, res, next) => {
     try {
       res.json(await reconcile());
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get("/api/queue", async (_req, res, next) => {
+    try {
+      res.json(await queueStats());
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get("/api/money/at", async (req, res, next) => {
+    try {
+      const at = req.query.at || new Date().toISOString();
+      res.json(await moneyAt(at));
     } catch (e) {
       next(e);
     }
